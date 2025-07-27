@@ -350,6 +350,38 @@ __aicore__ inline uint32_t getBroadcastIndexFast(uint32_t outputIndex, uint32_t 
     return outputIndex % inputSize;
 }
 
+// 声明 scalar_binary_gcd 函数，移动到使用之前
+template<typename T>
+__aicore__ inline T scalar_binary_gcd(T a, T b) {
+    if (a == 0) return b > 0 ? b : -b;
+    if (b == 0) return a > 0 ? a : -a;
+    
+    using UnsignedT = typename std::make_unsigned<T>::type;
+    UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
+    UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
+    
+    uint32_t shift = 0;
+    while (((ua | ub) & 1) == 0) {
+        ua >>= 1;
+        ub >>= 1;
+        shift++;
+    }
+    
+    while ((ua & 1) == 0) ua >>= 1;
+    
+    do {
+        while ((ub & 1) == 0) ub >>= 1;
+        if (ua > ub) {
+            UnsignedT temp = ua;
+            ua = ub;
+            ub = temp;
+        }
+        ub -= ua;
+    } while (ub != 0);
+    
+    return static_cast<T>(ua << shift);
+}
+
 // 向量化的二进制GCD算法 - Stein算法
 template<typename T>
 __aicore__ inline void vectorized_binary_gcd(const LocalTensor<T>& a_vec, const LocalTensor<T>& b_vec, 
@@ -418,37 +450,6 @@ __aicore__ inline void vectorized_binary_gcd(const LocalTensor<T>& a_vec, const 
             result_vec.SetValue(i, scalar_binary_gcd(a, b));
         }
     }
-}
-
-template<typename T>
-__aicore__ inline T scalar_binary_gcd(T a, T b) {
-    if (a == 0) return b > 0 ? b : -b;
-    if (b == 0) return a > 0 ? a : -a;
-    
-    using UnsignedT = typename std::make_unsigned<T>::type;
-    UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
-    UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
-    
-    uint32_t shift = 0;
-    while (((ua | ub) & 1) == 0) {
-        ua >>= 1;
-        ub >>= 1;
-        shift++;
-    }
-    
-    while ((ua & 1) == 0) ua >>= 1;
-    
-    do {
-        while ((ub & 1) == 0) ub >>= 1;
-        if (ua > ub) {
-            UnsignedT temp = ua;
-            ua = ub;
-            ub = temp;
-        }
-        ub -= ua;
-    } while (ub != 0);
-    
-    return static_cast<T>(ua << shift);
 }
 
 // 向量化LCM计算
@@ -521,6 +522,24 @@ __aicore__ inline void vectorized_lcm_compute(const LocalTensor<T>& a_vec, const
             
             // 对于64位数据，仍然使用标量计算但优化算法
             result_vec.SetValue(i, computeLcmBySize<T>(a, b, sizeof(T)));
+        }
+    }
+}
+
+// 安全的 Duplicate 函数，处理不支持的类型
+template<typename T>
+__aicore__ inline void SafeDuplicate(LocalTensor<T>& tensor, T value, uint32_t length) {
+    // 检查类型是否被 Duplicate API 支持
+    // 支持的类型: half, bfloat16_t, int16_t, uint16_t, int32_t, uint32_t, float
+    if (std::is_same<T, int16_t>::value || std::is_same<T, uint16_t>::value || 
+        std::is_same<T, int32_t>::value || std::is_same<T, uint32_t>::value || 
+        std::is_same<T, float>::value) {
+        // 对于支持的类型，使用 Duplicate API
+        Duplicate(tensor, value, length);
+    } else {
+        // 对于不支持的类型(int8_t, int64_t等)，使用循环手动填充
+        for (uint32_t i = 0; i < length; i++) {
+            tensor.SetValue(i, value);
         }
     }
 }
@@ -706,9 +725,9 @@ private:
         } else if (needBroadcastOther && canUseFastBroadcast) {
             // 快速广播路径
             if (otherSize == 1) {
-                // 标量广播 - 向量化填充
+                // 标量广播 - 使用安全的 Duplicate
                 DTYPE broadcastValue = otherGm.GetValue(0);
-                Duplicate(otherLocal, broadcastValue, length);
+                SafeDuplicate(otherLocal, broadcastValue, length);
             } else {
                 // 使用快速索引计算
                 #pragma unroll 8
