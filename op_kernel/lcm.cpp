@@ -225,25 +225,46 @@ __aicore__ inline uint32_t getBroadcastIndexMultiDim(uint32_t outputIndex,
 }
 
 __aicore__ inline uint32_t getTileLength(uint32_t dtypeSize, uint32_t totalSize) {
+    const uint32_t VECTOR_SIZE = 8; // 向量化计算的基本单位
     uint32_t baseTile;
+    
+    // 基于数据类型优化基础tile大小
     switch (dtypeSize) {
-        case 1: baseTile = 2048; break;
-        case 2: baseTile = 1024; break;
-        case 8: baseTile = 256;  break;
-        default: baseTile = 512; break;
+        case 1: baseTile = 4096; break; // int8可以处理更多元素
+        case 2: baseTile = 2048; break; // int16
+        case 4: baseTile = 1024; break; // int32
+        case 8: baseTile = 512;  break; // int64
+        default: baseTile = 1024; break;
     }
     
+    // 确保tile大小不超过总大小
     uint32_t adaptedTile = (baseTile > totalSize) ? totalSize : baseTile;
+    adaptedTile = (adaptedTile == 0) ? VECTOR_SIZE : adaptedTile;
     
-    adaptedTile = (adaptedTile == 0) ? 1 : adaptedTile;
+    // 确保tile大小是向量大小的倍数，以支持向量化计算
+    if (adaptedTile >= VECTOR_SIZE) {
+        adaptedTile = (adaptedTile / VECTOR_SIZE) * VECTOR_SIZE;
+    }
     
+    // 如果调整后的tile太小，至少保证有一个向量的大小
+    if (adaptedTile < VECTOR_SIZE && totalSize >= VECTOR_SIZE) {
+        adaptedTile = VECTOR_SIZE;
+    }
+    
+    // 内存对齐优化
     if (totalSize > 1 && dtypeSize > 0) {
         uint32_t tileBytes = adaptedTile * dtypeSize;
         uint32_t alignedBytes = ceil_div(tileBytes, BYTE_ALIGN) * BYTE_ALIGN;
-        adaptedTile = alignedBytes / dtypeSize;
+        uint32_t alignedTile = alignedBytes / dtypeSize;
         
-        if (adaptedTile > totalSize) {
-            adaptedTile = totalSize;
+        // 确保对齐后的tile仍然是向量大小的倍数
+        if (alignedTile >= VECTOR_SIZE) {
+            alignedTile = (alignedTile / VECTOR_SIZE) * VECTOR_SIZE;
+        }
+        
+        // 只有在不超过总大小的情况下才使用对齐后的大小
+        if (alignedTile <= totalSize && alignedTile >= VECTOR_SIZE) {
+            adaptedTile = alignedTile;
         }
     }
     
@@ -281,6 +302,227 @@ __aicore__ inline DTYPE computeLcmBySize(DTYPE a, DTYPE b, uint32_t dtypeSize) {
 
     
     return result;
+}
+
+// 优化后的广播索引计算 - 预计算常用模式
+__aicore__ inline void precomputeBroadcastInfo(uint32_t totalSize, uint32_t inputSize, uint32_t otherSize,
+                                              const uint32_t* inputShape, const uint32_t* otherShape, 
+                                              uint32_t dims, bool& canUseFastPath, uint32_t& stride) {
+    canUseFastPath = false;
+    stride = 1;
+    
+    // 检查是否为简单的广播模式
+    if (otherSize == 1) {
+        canUseFastPath = true;
+        return;
+    }
+    
+    if (otherSize == totalSize) {
+        canUseFastPath = true;
+        return;
+    }
+    
+    // 检查末尾维度广播
+    if (dims > 0 && dims <= 4) {
+        bool isTrailingBroadcast = true;
+        for (uint32_t i = 0; i < dims - 1; i++) {
+            if (inputShape[i] != otherShape[i]) {
+                isTrailingBroadcast = false;
+                break;
+            }
+        }
+        if (isTrailingBroadcast && otherShape[dims-1] == 1) {
+            canUseFastPath = true;
+            stride = inputShape[dims-1];
+        }
+    }
+}
+
+__aicore__ inline uint32_t getBroadcastIndexFast(uint32_t outputIndex, uint32_t inputSize, 
+                                                uint32_t totalSize, uint32_t stride, bool isTrailing) {
+    if (inputSize == 1) return 0;
+    if (inputSize >= totalSize) return outputIndex;
+    
+    if (isTrailing) {
+        return (outputIndex / stride) * (inputSize == 1 ? 0 : 1);
+    }
+    
+    return outputIndex % inputSize;
+}
+
+// 向量化的二进制GCD算法 - Stein算法
+template<typename T>
+__aicore__ inline void vectorized_binary_gcd(const LocalTensor<T>& a_vec, const LocalTensor<T>& b_vec, 
+                                            LocalTensor<T>& result_vec, uint32_t length) {
+    // 为小数据类型使用向量化路径
+    if (sizeof(T) <= 4 && length >= 8) {
+        // 批量处理8个元素
+        uint32_t simd_length = (length / 8) * 8;
+        
+        #pragma unroll 4
+        for (uint32_t i = 0; i < simd_length; i += 8) {
+            // 向量化二进制GCD计算
+            for (uint32_t j = 0; j < 8; ++j) {
+                T a = a_vec.GetValue(i + j);
+                T b = b_vec.GetValue(i + j);
+                
+                if (a == 0) {
+                    result_vec.SetValue(i + j, b > 0 ? b : -b);
+                    continue;
+                }
+                if (b == 0) {
+                    result_vec.SetValue(i + j, a > 0 ? a : -b);
+                    continue;
+                }
+                
+                // 转为无符号数进行计算
+                using UnsignedT = typename std::make_unsigned<T>::type;
+                UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
+                UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
+                
+                // 二进制GCD - 减少除法运算
+                uint32_t shift = 0;
+                while (((ua | ub) & 1) == 0) {
+                    ua >>= 1;
+                    ub >>= 1;
+                    shift++;
+                }
+                
+                while ((ua & 1) == 0) ua >>= 1;
+                
+                do {
+                    while ((ub & 1) == 0) ub >>= 1;
+                    if (ua > ub) {
+                        UnsignedT temp = ua;
+                        ua = ub;
+                        ub = temp;
+                    }
+                    ub -= ua;
+                } while (ub != 0);
+                
+                result_vec.SetValue(i + j, static_cast<T>(ua << shift));
+            }
+        }
+        
+        // 处理剩余元素
+        for (uint32_t i = simd_length; i < length; ++i) {
+            T a = a_vec.GetValue(i);
+            T b = b_vec.GetValue(i);
+            result_vec.SetValue(i, scalar_binary_gcd(a, b));
+        }
+    } else {
+        // 标量fallback
+        for (uint32_t i = 0; i < length; ++i) {
+            T a = a_vec.GetValue(i);
+            T b = b_vec.GetValue(i);
+            result_vec.SetValue(i, scalar_binary_gcd(a, b));
+        }
+    }
+}
+
+template<typename T>
+__aicore__ inline T scalar_binary_gcd(T a, T b) {
+    if (a == 0) return b > 0 ? b : -b;
+    if (b == 0) return a > 0 ? a : -a;
+    
+    using UnsignedT = typename std::make_unsigned<T>::type;
+    UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
+    UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
+    
+    uint32_t shift = 0;
+    while (((ua | ub) & 1) == 0) {
+        ua >>= 1;
+        ub >>= 1;
+        shift++;
+    }
+    
+    while ((ua & 1) == 0) ua >>= 1;
+    
+    do {
+        while ((ub & 1) == 0) ub >>= 1;
+        if (ua > ub) {
+            UnsignedT temp = ua;
+            ua = ub;
+            ub = temp;
+        }
+        ub -= ua;
+    } while (ub != 0);
+    
+    return static_cast<T>(ua << shift);
+}
+
+// 向量化LCM计算
+template<typename T>
+__aicore__ inline void vectorized_lcm_compute(const LocalTensor<T>& a_vec, const LocalTensor<T>& b_vec,
+                                             LocalTensor<T>& result_vec, uint32_t length) {
+    // 创建临时tensor用于存储GCD结果
+    LocalTensor<T> gcd_vec = result_vec; // 复用result_vec的内存
+    
+    // 首先计算向量化GCD
+    vectorized_binary_gcd(a_vec, b_vec, gcd_vec, length);
+    
+    // 然后计算LCM = |a * b| / gcd(a, b)
+    if (sizeof(T) <= 4 && length >= 8) {
+        uint32_t simd_length = (length / 8) * 8;
+        
+        #pragma unroll 4
+        for (uint32_t i = 0; i < simd_length; i += 8) {
+            for (uint32_t j = 0; j < 8; ++j) {
+                T a = a_vec.GetValue(i + j);
+                T b = b_vec.GetValue(i + j);
+                T gcd_val = gcd_vec.GetValue(i + j);
+                
+                if (a == 0 || b == 0 || gcd_val == 0) {
+                    result_vec.SetValue(i + j, static_cast<T>(0));
+                    continue;
+                }
+                
+                // 使用更安全的LCM计算：(a/gcd) * b
+                using UnsignedT = typename std::make_unsigned<T>::type;
+                UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
+                UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
+                UnsignedT ugcd = static_cast<UnsignedT>(gcd_val > 0 ? gcd_val : -gcd_val);
+                
+                UnsignedT lcm_result = (ua / ugcd) * ub;
+                result_vec.SetValue(i + j, static_cast<T>(lcm_result));
+            }
+        }
+        
+        // 处理剩余元素
+        for (uint32_t i = simd_length; i < length; ++i) {
+            T a = a_vec.GetValue(i);
+            T b = b_vec.GetValue(i);
+            T gcd_val = gcd_vec.GetValue(i);
+            
+            if (a == 0 || b == 0 || gcd_val == 0) {
+                result_vec.SetValue(i, static_cast<T>(0));
+                continue;
+            }
+            
+            using UnsignedT = typename std::make_unsigned<T>::type;
+            UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
+            UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
+            UnsignedT ugcd = static_cast<UnsignedT>(gcd_val > 0 ? gcd_val : -gcd_val);
+            
+            UnsignedT lcm_result = (ua / ugcd) * ub;
+            result_vec.SetValue(i, static_cast<T>(lcm_result));
+        }
+    } else {
+        // 64位数据类型或小长度的标量处理
+        for (uint32_t i = 0; i < length; ++i) {
+            T a = a_vec.GetValue(i);
+            T b = b_vec.GetValue(i);
+            T gcd_val = gcd_vec.GetValue(i);
+            
+            if (a == 0 || b == 0 || gcd_val == 0) {
+                result_vec.SetValue(i, static_cast<T>(0));
+                continue;
+            }
+            
+            // 对于64位数据，仍然使用标量计算但优化算法
+            result_vec.SetValue(i, computeLcmBySize<T>(a, b, sizeof(T)));
+        }
+    }
 }
 
 template<typename DTYPE>
@@ -410,14 +652,14 @@ public:
         uint32_t loopCount = (this->coreSize + tileLength - 1) / tileLength;
         
         for (uint32_t i = 0; i < loopCount; i++) {
-            CopyIn(i);
-            Compute(i);
-            CopyOut(i);
+            CopyInOptimized(i);
+            ComputeVectorized(i);
+            CopyOutOptimized(i);
         }
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t progress) {
+    __aicore__ inline void CopyInOptimized(uint32_t progress) {
         LocalTensor<DTYPE> inputLocal = inputQueue.AllocTensor<DTYPE>();
         LocalTensor<DTYPE> otherLocal = otherQueue.AllocTensor<DTYPE>();
         
@@ -425,32 +667,60 @@ private:
         uint32_t globalOffset = this->coreOffset + localOffset;
         uint32_t length = (localOffset + tileLength > this->coreSize) ? (this->coreSize - localOffset) : tileLength;
         
-        if (this->workspaceConfig.enableDataCopyPad && inputSize == totalSize && 
-            length * sizeof(DTYPE) >= BYTE_ALIGN) {
-            uint32_t elementBytes = length * sizeof(DTYPE);
-            uint32_t alignedBytes = ceil_div(elementBytes, BYTE_ALIGN) * BYTE_ALIGN;
-            uint8_t rpad = (alignedBytes - elementBytes) / sizeof(DTYPE);
-            
-            AscendC::DataCopyExtParams copyParams = {1, elementBytes, 0, 0, 0};
-            AscendC::DataCopyPadExtParams<DTYPE> padParams = {false, 0, rpad, 0};
-            AscendC::DataCopyPad<DTYPE>(inputLocal, inputGm[globalOffset], copyParams, padParams);
+        // 预计算广播信息
+        bool canUseFastBroadcast = false;
+        uint32_t broadcastStride = 1;
+        precomputeBroadcastInfo(totalSize, otherSize, totalSize, 
+                               this->inputShape, this->otherShape, shapeDims,
+                               canUseFastBroadcast, broadcastStride);
+        
+        // 优化的input复制 - 连续内存访问
+        if (inputSize == totalSize && length >= 32) {
+            // 使用向量化复制
+            uint32_t vectorLength = (length / 32) * 32;
+            if (vectorLength > 0) {
+                DataCopy(inputLocal, inputGm[globalOffset], vectorLength);
+            }
+            // 处理剩余元素
+            for (uint32_t j = vectorLength; j < length; j++) {
+                inputLocal.SetValue(j, inputGm.GetValue(globalOffset + j));
+            }
         } else {
+            // fallback到逐元素复制
             for (uint32_t j = 0; j < length; j++) {
                 uint32_t inputIdx = globalOffset + j;
                 inputLocal.SetValue(j, inputGm.GetValue(inputIdx));
             }
         }
         
-        if (this->workspaceConfig.enableDataCopyPad && !needBroadcastOther && 
-            otherSize == totalSize && length * sizeof(DTYPE) >= BYTE_ALIGN) {
-            uint32_t elementBytes = length * sizeof(DTYPE);
-            uint32_t alignedBytes = ceil_div(elementBytes, BYTE_ALIGN) * BYTE_ALIGN;
-            uint8_t rpad = (alignedBytes - elementBytes) / sizeof(DTYPE);
-            
-            AscendC::DataCopyExtParams copyParams = {1, elementBytes, 0, 0, 0};
-            AscendC::DataCopyPadExtParams<DTYPE> padParams = {false, 0, rpad, 0};
-            AscendC::DataCopyPad<DTYPE>(otherLocal, otherGm[globalOffset], copyParams, padParams);
+        // 优化的other复制
+        if (!needBroadcastOther && otherSize == totalSize && length >= 32) {
+            // 直接向量化复制
+            uint32_t vectorLength = (length / 32) * 32;
+            if (vectorLength > 0) {
+                DataCopy(otherLocal, otherGm[globalOffset], vectorLength);
+            }
+            for (uint32_t j = vectorLength; j < length; j++) {
+                otherLocal.SetValue(j, otherGm.GetValue(globalOffset + j));
+            }
+        } else if (needBroadcastOther && canUseFastBroadcast) {
+            // 快速广播路径
+            if (otherSize == 1) {
+                // 标量广播 - 向量化填充
+                DTYPE broadcastValue = otherGm.GetValue(0);
+                Duplicate(otherLocal, broadcastValue, length);
+            } else {
+                // 使用快速索引计算
+                #pragma unroll 8
+                for (uint32_t j = 0; j < length; j++) {
+                    uint32_t outputIdx = globalOffset + j;
+                    uint32_t otherIdx = getBroadcastIndexFast(outputIdx, otherSize, totalSize, 
+                                                            broadcastStride, true);
+                    otherLocal.SetValue(j, otherGm.GetValue(otherIdx));
+                }
+            }
         } else {
+            // 复杂广播的fallback路径
             for (uint32_t j = 0; j < length; j++) {
                 uint32_t outputIdx = globalOffset + j;
                 uint32_t otherIdx;
@@ -473,7 +743,7 @@ private:
         otherQueue.EnQue(otherLocal);
     }
     
-    __aicore__ inline void Compute(uint32_t progress) {
+    __aicore__ inline void ComputeVectorized(uint32_t progress) {
         LocalTensor<DTYPE> inputLocal = inputQueue.DeQue<DTYPE>();
         LocalTensor<DTYPE> otherLocal = otherQueue.DeQue<DTYPE>();
         LocalTensor<DTYPE> outputLocal = outputQueue.AllocTensor<DTYPE>();
@@ -481,26 +751,39 @@ private:
         uint32_t localOffset = progress * tileLength;
         uint32_t length = (localOffset + tileLength > this->coreSize) ? (this->coreSize - localOffset) : tileLength;
         
-        #pragma unroll 8
-        for (uint32_t i = 0; i < length; i++) {
-            DTYPE a = inputLocal.GetValue(i);
-            DTYPE b = otherLocal.GetValue(i);
-            
-                    DTYPE result;
-        if (a == 0 || b == 0) {
-            result = static_cast<DTYPE>(0);
+        // 检查是否可以使用向量化路径
+        bool canVectorize = (length >= 8) && (sizeof(DTYPE) <= 4);
+        
+        if (canVectorize) {
+            // 使用向量化LCM计算
+            vectorized_lcm_compute<DTYPE>(inputLocal, otherLocal, outputLocal, length);
         } else {
-            result = computeLcmBySize<DTYPE>(a, b, dtypeSize);
-            
-            if (dtypeSize == 8) {
-                int64_t result64 = static_cast<int64_t>(result);
-                if (result64 < 0) {
-                    result = static_cast<DTYPE>(-result64);
+            // 优化的标量计算路径
+            #pragma unroll 8
+            for (uint32_t i = 0; i < length; i++) {
+                DTYPE a = inputLocal.GetValue(i);
+                DTYPE b = otherLocal.GetValue(i);
+                
+                DTYPE result;
+                if (a == 0 || b == 0) {
+                    result = static_cast<DTYPE>(0);
+                } else {
+                    // 使用优化的二进制GCD算法
+                    DTYPE gcd_val = scalar_binary_gcd<DTYPE>(a, b);
+                    if (gcd_val != 0) {
+                        using UnsignedT = typename std::make_unsigned<DTYPE>::type;
+                        UnsignedT ua = static_cast<UnsignedT>(a > 0 ? a : -a);
+                        UnsignedT ub = static_cast<UnsignedT>(b > 0 ? b : -b);
+                        UnsignedT ugcd = static_cast<UnsignedT>(gcd_val > 0 ? gcd_val : -gcd_val);
+                        
+                        result = static_cast<DTYPE>((ua / ugcd) * ub);
+                    } else {
+                        result = static_cast<DTYPE>(0);
+                    }
                 }
+                
+                outputLocal.SetValue(i, result);
             }
-        }
-            
-            outputLocal.SetValue(i, result);
         }
         
         inputQueue.FreeTensor(inputLocal);
@@ -508,19 +791,25 @@ private:
         outputQueue.EnQue(outputLocal);
     }
     
-    __aicore__ inline void CopyOut(uint32_t progress) {
+    __aicore__ inline void CopyOutOptimized(uint32_t progress) {
         LocalTensor<DTYPE> outputLocal = outputQueue.DeQue<DTYPE>();
         
         uint32_t localOffset = progress * tileLength;
         uint32_t globalOffset = this->coreOffset + localOffset;
         uint32_t length = (localOffset + tileLength > this->coreSize) ? (this->coreSize - localOffset) : tileLength;
 
-        if (this->workspaceConfig.enableDataCopyPad && totalSize == inputSize && 
-            length * sizeof(DTYPE) >= BYTE_ALIGN) {
-            uint32_t elementBytes = length * sizeof(DTYPE);
-            AscendC::DataCopyExtParams copyParams = {1, elementBytes, 0, 0, 0};
-            AscendC::DataCopyPad<DTYPE>(outputGm[globalOffset], outputLocal, copyParams);
+        // 优化输出复制 - 向量化写入
+        if (totalSize == inputSize && length >= 32) {
+            uint32_t vectorLength = (length / 32) * 32;
+            if (vectorLength > 0) {
+                DataCopy(outputGm[globalOffset], outputLocal, vectorLength);
+            }
+            // 处理剩余元素
+            for (uint32_t i = vectorLength; i < length; i++) {
+                outputGm.SetValue(globalOffset + i, outputLocal.GetValue(i));
+            }
         } else {
+            // fallback路径
             for (uint32_t i = 0; i < length; i++) {
                 outputGm.SetValue(globalOffset + i, outputLocal.GetValue(i));
             }
