@@ -56,13 +56,42 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     uint32_t needBroadcastInput = 0;
     uint32_t needBroadcastOther = (otherSize != totalSize) ? 1 : 0;
     
+    // 优化的核心分配策略
     const uint32_t MAX_CORE_NUM = 32;
-    const uint32_t MIN_ELEMENTS_PER_CORE = 32;
+    const uint32_t VECTOR_SIZE = 8; // 向量化计算的基本单位
     
-    uint32_t usedCoreNum = std::min(MAX_CORE_NUM, CeilDiv(totalSize, MIN_ELEMENTS_PER_CORE));
+    // 基于数据大小和类型动态调整最小处理单元
+    uint32_t minElementsPerCore;
+    if (dtypeSize <= 2) {
+        minElementsPerCore = 1024; // 小数据类型可以处理更多元素
+    } else if (dtypeSize == 4) {
+        minElementsPerCore = 512;
+    } else {
+        minElementsPerCore = 256; // 64位数据类型
+    }
+    
+    // 确保每个核心处理的元素数量是向量大小的倍数
+    minElementsPerCore = ((minElementsPerCore + VECTOR_SIZE - 1) / VECTOR_SIZE) * VECTOR_SIZE;
+    
+    // 计算理想的核心数量
+    uint32_t idealCoreNum = CeilDiv(totalSize, minElementsPerCore);
+    uint32_t usedCoreNum = std::min(MAX_CORE_NUM, idealCoreNum);
     usedCoreNum = std::max(1u, usedCoreNum);
     
-    uint32_t singleCoreSize = totalSize / usedCoreNum;
+    // 优化负载均衡
+    uint32_t elementsPerCore = totalSize / usedCoreNum;
+    uint32_t remainder = totalSize % usedCoreNum;
+    
+    // 确保每个核心处理的元素数量是向量大小的倍数
+    if (elementsPerCore % VECTOR_SIZE != 0) {
+        elementsPerCore = ((elementsPerCore + VECTOR_SIZE - 1) / VECTOR_SIZE) * VECTOR_SIZE;
+        // 重新计算核心数量
+        usedCoreNum = CeilDiv(totalSize, elementsPerCore);
+        usedCoreNum = std::min(MAX_CORE_NUM, usedCoreNum);
+        usedCoreNum = std::max(1u, usedCoreNum);
+    }
+    
+    uint32_t singleCoreSize = elementsPerCore;
     
     context->SetBlockDim(usedCoreNum);
     tiling.set_totalSize(totalSize);
@@ -71,8 +100,20 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     tiling.set_dtypeSize(dtypeSize);
     tiling.set_needBroadcastInput(needBroadcastInput);
     tiling.set_needBroadcastOther(needBroadcastOther);
-    tiling.set_tileNum(TILE_NUM);
     
+    // 优化tile大小计算
+    uint32_t optimalTileNum = TILE_NUM;
+    
+    // 基于数据特征调整tile数量
+    if (needBroadcastOther) {
+        // 广播操作需要更小的tile以减少内存压力
+        optimalTileNum = std::min(TILE_NUM, 4u);
+    } else if (totalSize > 1024 * 1024) {
+        // 大数据集使用更多tile进行流水线优化
+        optimalTileNum = std::min(TILE_NUM * 2, 16u);
+    }
+    
+    tiling.set_tileNum(optimalTileNum);
     tiling.set_usedCoreNum(usedCoreNum);
     tiling.set_singleCoreSize(singleCoreSize);
     
@@ -105,8 +146,15 @@ static ge::graphStatus TilingFunc(gert::TilingContext *context)
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
     
+    // 计算工作空间大小 - 为向量化计算预留更多空间
     size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 0;
+    uint32_t maxTileSize = 2048; // 基于dtypeSize动态调整
+    if (dtypeSize <= 2) {
+        maxTileSize = 4096;
+    } else if (dtypeSize == 8) {
+        maxTileSize = 1024;
+    }
+    currentWorkspace[0] = maxTileSize * dtypeSize * 4; // 为临时计算预留4倍空间
     
     return ge::GRAPH_SUCCESS;
 }
