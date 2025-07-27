@@ -531,16 +531,29 @@ template<typename T>
 __aicore__ inline void SafeDuplicate(LocalTensor<T>& tensor, T value, uint32_t length) {
     // 检查类型是否被 Duplicate API 支持
     // 支持的类型: half, bfloat16_t, int16_t, uint16_t, int32_t, uint32_t, float
-    if (std::is_same<T, int16_t>::value || std::is_same<T, uint16_t>::value || 
+    // 注意：不支持 int8_t/signed char/char, int64_t/long 等类型
+    
+    // 使用 SFINAE 和模板特化来避免编译时错误
+    SafeDuplicateImpl(tensor, value, length, typename std::integral_constant<bool,
+        std::is_same<T, int16_t>::value || std::is_same<T, uint16_t>::value || 
         std::is_same<T, int32_t>::value || std::is_same<T, uint32_t>::value || 
-        std::is_same<T, float>::value) {
-        // 对于支持的类型，使用 Duplicate API
-        Duplicate(tensor, value, length);
-    } else {
-        // 对于不支持的类型(int8_t, int64_t等)，使用循环手动填充
-        for (uint32_t i = 0; i < length; i++) {
-            tensor.SetValue(i, value);
-        }
+        std::is_same<T, float>::value ||
+        std::is_same<T, short>::value || std::is_same<T, unsigned short>::value ||
+        std::is_same<T, int>::value || std::is_same<T, unsigned int>::value
+    >::type{});
+}
+
+template<typename T>
+__aicore__ inline void SafeDuplicateImpl(LocalTensor<T>& tensor, T value, uint32_t length, std::true_type) {
+    // 对于支持的类型，使用 Duplicate API
+    Duplicate(tensor, value, length);
+}
+
+template<typename T>
+__aicore__ inline void SafeDuplicateImpl(LocalTensor<T>& tensor, T value, uint32_t length, std::false_type) {
+    // 对于不支持的类型(int8_t, int64_t, signed char, long等)，使用循环手动填充
+    for (uint32_t i = 0; i < length; i++) {
+        tensor.SetValue(i, value);
     }
 }
 
